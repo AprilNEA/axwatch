@@ -1,0 +1,36 @@
+[package]
+name = "axwatch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AprilNEA/axwatch"
+authors = ["AprilNEA <dev@aprilnea.me>"]
+description = "Watch the macOS Accessibility grant: the distributed notification that fires when the Accessibility list changes, a heartbeat backstop, and typed trust reads."
+readme = "README.md"
+keywords = ["macos", "accessibility", "tcc", "permissions", "notification"]
+categories = ["os::macos-apis", "os"]
+
+# The whole point of the crate is the macOS path; build the docs against it so
+# docs.rs shows that, not the fallback.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+undocumented_unsafe_blocks = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+[dependencies]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "HIServices", "AXUIElement"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString", "CFNotificationCenter", "CFRunLoop"] }

@@ -1,0 +1,5 @@
+# Tests use `unwrap`/`expect` freely.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+# Proper nouns the docs name without backticks; `..` keeps clippy's defaults.
+doc-valid-idents = ["WindowServer", "HIServices", "WebKit", "AltTab", "Hammerspoon", ".."]
