@@ -6,7 +6,7 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/AprilNEA/axwatch"
 authors = ["AprilNEA <dev@aprilnea.me>"]
-description = "Watch the macOS Accessibility grant: the distributed notification that fires when the Accessibility list changes, a heartbeat backstop, and typed trust reads."
+description = "Watch the macOS Accessibility grant: the two undocumented notifications that fire when the Accessibility list is edited, a heartbeat backstop, and typed trust reads."
 readme = "README.md"
 keywords = ["macos", "accessibility", "tcc", "permissions", "notification"]
 categories = ["os::macos-apis", "os"]
@@ -28,8 +28,6 @@ expect_used = "warn"
 undocumented_unsafe_blocks = "warn"
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
-
-[dependencies]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "HIServices", "AXUIElement"] }
