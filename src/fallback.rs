@@ -16,6 +16,10 @@ pub(crate) fn request() {}
 pub(crate) struct Observer;
 
 impl Observer {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the macOS registration can fail; this shares its signature"
+    )]
     pub(crate) fn install(_handler: Handler) -> io::Result<Self> {
         Ok(Self)
     }
