@@ -1,4 +1,4 @@
-//! macOS: the AX trust reads and the distributed-notification observer.
+//! macOS: the AX trust reads and the two notification registrations.
 
 #![expect(
     unsafe_code,
@@ -7,7 +7,8 @@
 
 use std::ffi::c_void;
 use std::io;
-use std::sync::{Mutex, PoisonError};
+use std::ptr;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use objc2_application_services::{
     AXIsProcessTrusted, AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt,
@@ -17,7 +18,7 @@ use objc2_core_foundation::{
     CFRetained, CFString, kCFBooleanTrue,
 };
 
-use crate::{Handler, NOTIFICATION, Wake};
+use crate::{ACCESSIBILITY_NOTIFICATION, Handler, PRIVACY_NOTIFICATION, Wake};
 
 pub(crate) fn is_trusted() -> bool {
     // SAFETY: takes no arguments and only reads the current trust state.
@@ -38,60 +39,108 @@ pub(crate) fn request() {
     let _trusted = unsafe { AXIsProcessTrustedWithOptions(Some(options.as_opaque())) };
 }
 
-/// What the notification callback finds at the observer address: the handler,
-/// or `None` once the [`Observer`] is gone.
+/// Both registrations: the distributed notification for the Accessibility
+/// list and the Darwin notification for privacy records. Dropping it
+/// unregisters both and drops the handler.
+pub(crate) struct Observer {
+    _accessibility: Registration,
+    _privacy: Registration,
+}
+
+impl Observer {
+    pub(crate) fn install(handler: Handler) -> io::Result<Self> {
+        let distributed = CFNotificationCenter::distributed_center()
+            .ok_or_else(|| io::Error::other("no distributed notification center"))?;
+        let darwin = CFNotificationCenter::darwin_notify_center()
+            .ok_or_else(|| io::Error::other("no Darwin notification center"))?;
+        Ok(Self {
+            _accessibility: Registration::add(
+                distributed,
+                ACCESSIBILITY_NOTIFICATION,
+                // Bypasses the suspension AppKit applies to inactive applications.
+                CFNotificationSuspensionBehavior::DeliverImmediately,
+                Wake::AccessibilityChanged,
+                Arc::clone(&handler),
+            ),
+            _privacy: Registration::add(
+                darwin,
+                PRIVACY_NOTIFICATION,
+                // The Darwin center always delivers immediately, ignores this
+                // argument and asks for 0 in its place (CFNotificationCenter.h).
+                CFNotificationSuspensionBehavior(0),
+                Wake::PrivacyChanged,
+                handler,
+            ),
+        })
+    }
+}
+
+/// What a notification callback finds at its observer address: the wake this
+/// registration reports, and the handler — `None` once the registration is
+/// gone.
 ///
 /// The cell is leaked on purpose. Notifications are delivered on the main
 /// run loop, and removing the observer from another thread does not wait for
 /// a delivery already in flight; keeping the address valid forever and
 /// emptying the cell instead makes that delivery a no-op. The handler itself
 /// — the user's closure and everything it captured — is dropped.
-struct Cell(Mutex<Option<Handler>>);
+struct Cell {
+    wake: Wake,
+    handler: Mutex<Option<Handler>>,
+}
 
-/// The registered observer. Dropping it unregisters and drops the handler.
-pub(crate) struct Observer {
+/// One observer registration on one notification center.
+struct Registration {
     center: CFRetained<CFNotificationCenter>,
     name: CFRetained<CFString>,
     cell: &'static Cell,
 }
 
-impl Observer {
-    pub(crate) fn install(handler: Handler) -> io::Result<Self> {
-        let center = CFNotificationCenter::distributed_center()
-            .ok_or_else(|| io::Error::other("no distributed notification center"))?;
-        let name = CFString::from_str(NOTIFICATION);
-        let cell: &'static Cell = Box::leak(Box::new(Cell(Mutex::new(Some(handler)))));
+impl Registration {
+    fn add(
+        center: CFRetained<CFNotificationCenter>,
+        name: &str,
+        suspension: CFNotificationSuspensionBehavior,
+        wake: Wake,
+        handler: Handler,
+    ) -> Self {
+        let name = CFString::from_str(name);
+        let cell: &'static Cell = Box::leak(Box::new(Cell {
+            wake,
+            handler: Mutex::new(Some(handler)),
+        }));
         // SAFETY: `notified` matches `CFNotificationCallback`; the observer
         // address is `cell`, which is never freed, so the callback can read it
-        // for as long as the registration exists and after. `DeliverImmediately`
-        // bypasses the suspension AppKit applies to inactive applications.
+        // for as long as the registration exists and after. Neither center
+        // wants an object: the distributed notification is posted without
+        // one, and the Darwin center has no objects at all.
         unsafe {
             center.add_observer(
-                std::ptr::from_ref(cell).cast(),
+                ptr::from_ref(cell).cast(),
                 Some(notified),
                 Some(&name),
-                std::ptr::null(),
-                CFNotificationSuspensionBehavior::DeliverImmediately,
+                ptr::null(),
+                suspension,
             );
         }
-        Ok(Self { center, name, cell })
+        Self { center, name, cell }
     }
 }
 
-impl Drop for Observer {
+impl Drop for Registration {
     fn drop(&mut self) {
         // SAFETY: the same observer address, name and (null) object the
         // registration used.
         unsafe {
             self.center.remove_observer(
-                std::ptr::from_ref(self.cell).cast(),
+                ptr::from_ref(self.cell).cast(),
                 Some(&self.name),
-                std::ptr::null(),
+                ptr::null(),
             );
         }
         // Waits for a delivery in progress, then drops the handler.
         self.cell
-            .0
+            .handler
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
@@ -101,9 +150,9 @@ impl Drop for Observer {
 // SAFETY: `CFNotificationCenter` and immutable `CFString` are thread-safe
 // Core Foundation objects, and the cell is a `Mutex` behind a `'static`
 // reference; nothing here is tied to the thread that registered.
-unsafe impl Send for Observer {}
-// SAFETY: as above; `&Observer` exposes no operation at all.
-unsafe impl Sync for Observer {}
+unsafe impl Send for Registration {}
+// SAFETY: as above; `&Registration` exposes no operation at all.
+unsafe impl Sync for Registration {}
 
 unsafe extern "C-unwind" fn notified(
     _center: *mut CFNotificationCenter,
@@ -113,11 +162,11 @@ unsafe extern "C-unwind" fn notified(
     _user_info: *const CFDictionary,
 ) {
     // SAFETY: `observer` is the address of the leaked `Cell` registered in
-    // `Observer::install`, valid for the life of the process.
+    // `Registration::add`, valid for the life of the process.
     let cell = unsafe { &*observer.cast::<Cell>() };
-    // Held across the call so `Observer::drop` cannot free the handler under
-    // it; a delivery after the drop finds the cell empty.
-    if let Some(handler) = &*cell.0.lock().unwrap_or_else(PoisonError::into_inner) {
-        handler(Wake::Changed);
+    // Held across the call so `Registration::drop` cannot free the handler
+    // under it; a delivery after the drop finds the cell empty.
+    if let Some(handler) = &*cell.handler.lock().unwrap_or_else(PoisonError::into_inner) {
+        handler(cell.wake);
     }
 }

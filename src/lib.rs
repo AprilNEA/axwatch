@@ -6,15 +6,25 @@
 //! poller is least welcome — around a sleep transition, when WindowServer can
 //! take seconds to answer.
 //!
-//! What macOS does have is an undocumented distributed notification,
-//! [`NOTIFICATION`] (`com.apple.accessibility.api`), that HIServices posts
-//! whenever the Accessibility list changes for *any* application. WebKit lists
-//! it among the notifications it forwards into its sandboxed processes, and
-//! AltTab, Hammerspoon and others observe it to learn about revocation. This
-//! crate registers for it with `DeliverImmediately` suspension behaviour — so
-//! an app that is never frontmost still hears it — and pairs it with an
-//! optional heartbeat, because the notification is undocumented and a few
-//! things are known to swallow it.
+//! What macOS does have is two undocumented notifications that fire when the
+//! list is edited:
+//!
+//! - [`ACCESSIBILITY_NOTIFICATION`] (`com.apple.accessibility.api`), a
+//!   distributed notification HIServices posts when the Accessibility list
+//!   changes for *any* application. WebKit lists it among the notifications
+//!   it forwards into its sandboxed processes; AltTab, Hammerspoon and others
+//!   observe it to learn about revocation.
+//! - [`PRIVACY_NOTIFICATION`] (`com.apple.tcc.access.changed`), a Darwin
+//!   (`notify(3)`) notification tccd posts when any privacy record changes —
+//!   any service, any application, system-wide.
+//!
+//! Neither alone covers every edit. Measured on macOS 26 (September 2026):
+//! adding a row, switching it off and switching it on post both; *removing*
+//! the row posts only the Darwin notification, twice. This crate registers
+//! for both — the distributed one with `DeliverImmediately` suspension
+//! behaviour, so an app that is never frontmost still hears it — and pairs
+//! them with an optional heartbeat, because both names are undocumented and
+//! a few things are known to swallow them.
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -33,26 +43,31 @@
 //!
 //! # What a wake means
 //!
-//! [`Wake::Changed`] means the Accessibility list changed somewhere — possibly
-//! for another app. [`Wake::Heartbeat`] means nothing but time passed. Neither
-//! says what this process's grant now is: read it. [`is_trusted`] is the cheap
-//! answer, with one caveat that matters if your safety depends on it:
-//! `AXIsProcessTrusted` keeps returning `true` after the user *removes* the
-//! app's row from System Settings (as opposed to switching it off), and on
-//! macOS 13+ it can lag a toggle by a moment. A process holding an active
-//! `CGEventTap` should confirm with a capability probe — creating a filtering
-//! tap and checking for `NULL` — rather than trust the read alone.
+//! [`Wake::AccessibilityChanged`] and [`Wake::PrivacyChanged`] mean the
+//! respective list changed somewhere — possibly for another app, possibly for
+//! another privacy service — and one edit usually produces both, so the
+//! handler must be cheap and idempotent. [`Wake::Heartbeat`] means nothing
+//! but time passed. None of them says what this process's grant now is: read
+//! it. [`is_trusted`] is the cheap answer, with one caveat that matters if
+//! your safety depends on it: `AXIsProcessTrusted` keeps returning `true`
+//! after the user *removes* the app's row from System Settings (as opposed
+//! to switching it off), and on macOS 13+ it can lag a toggle by a moment. A
+//! process holding an active `CGEventTap` should confirm with a capability
+//! probe — creating a filtering tap and checking for `NULL` — rather than
+//! trust the read alone.
 //!
-//! # What can swallow the notification
+//! # What can swallow a notification
 //!
-//! - Delivery needs a run loop: distributed notifications arrive through the
-//!   main thread's `CFRunLoop`. A process that never runs one (a plain CLI,
-//!   or a daemon that only blocks on a channel) sees only heartbeats.
-//! - Since macOS 15, distributed notifications are silently withheld from
-//!   unsigned binaries. Ad-hoc-signed development builds may be affected;
-//!   Developer ID and App Store builds are not.
-//! - The name is undocumented; which System Settings actions post it (switch
-//!   off, remove the row, reset with `tccutil`) is not characterised by Apple.
+//! - Delivery needs a run loop: both kinds arrive through the main thread's
+//!   `CFRunLoop`, running in a common mode. A process that never runs one (a
+//!   plain CLI, or a daemon that only blocks on a channel) sees only
+//!   heartbeats.
+//! - Since macOS 15, distributed notifications are withheld from unsigned
+//!   binaries; ad-hoc-signed development builds do receive them. The Darwin
+//!   notification travels through notifyd rather than distnoted and is not
+//!   subject to that rule.
+//! - Both names are undocumented. Which edits post them is measured above,
+//!   not specified, and may change with a macOS release.
 //!
 //! The heartbeat exists for those three. Choose its period from what a missed
 //! notification would cost you: a few seconds for a process whose active
@@ -83,9 +98,16 @@ use fallback as platform;
 use macos as platform;
 
 /// The distributed notification HIServices posts when the Accessibility list
-/// changes for any application. Undocumented, long-lived, and forwarded by
-/// WebKit into its sandboxed processes.
-pub const NOTIFICATION: &str = "com.apple.accessibility.api";
+/// changes for any application: a row added, switched on or switched off —
+/// not removed. Undocumented, long-lived, and forwarded by WebKit into its
+/// sandboxed processes.
+pub const ACCESSIBILITY_NOTIFICATION: &str = "com.apple.accessibility.api";
+
+/// The Darwin (`notify(3)`) notification tccd posts when a privacy record
+/// changes: any service, any application, system-wide — including the removal
+/// of an Accessibility row, which posts it twice. Undocumented; observable
+/// from a shell with `notifyutil -v -w com.apple.tcc.access.changed`.
+pub const PRIVACY_NOTIFICATION: &str = "com.apple.tcc.access.changed";
 
 /// Whether this process is currently a trusted Accessibility client
 /// (`AXIsProcessTrusted`). Never prompts. See the crate docs for when this
@@ -106,9 +128,12 @@ pub fn request() {
 /// Why a [`Watch`] called its handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
-    /// [`NOTIFICATION`] arrived: the Accessibility list changed, for this
-    /// app or another.
-    Changed,
+    /// [`ACCESSIBILITY_NOTIFICATION`] arrived: the Accessibility list changed,
+    /// for this app or another.
+    AccessibilityChanged,
+    /// [`PRIVACY_NOTIFICATION`] arrived: a privacy record changed, for any
+    /// service and any app.
+    PrivacyChanged,
     /// The heartbeat period elapsed.
     Heartbeat,
 }
@@ -126,7 +151,7 @@ pub struct Watch {
 }
 
 impl Watch {
-    /// Register for [`NOTIFICATION`] and, with `heartbeat`, also call the
+    /// Register for both notifications and, with `heartbeat`, also call the
     /// handler every period. The handler runs on whichever thread delivers
     /// the wake — the main run loop for a notification, a private thread for
     /// the heartbeat — so keep it short and thread-safe, and do the real work
@@ -134,8 +159,8 @@ impl Watch {
     ///
     /// # Errors
     ///
-    /// The heartbeat thread could not be spawned, or (macOS) the distributed
-    /// notification center is unavailable to this process.
+    /// The heartbeat thread could not be spawned, or (macOS) a notification
+    /// center is unavailable to this process.
     pub fn start(
         heartbeat: Option<Duration>,
         on_wake: impl Fn(Wake) + Send + Sync + 'static,
@@ -224,6 +249,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_watch_can_live_in_shared_state() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Watch>();
+    }
+
+    #[test]
     fn heartbeat_wakes_on_its_period_and_stops_on_drop() {
         let wakes = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&wakes);
@@ -246,7 +277,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|wake| *wake == Wake::Heartbeat),
-            "nothing but heartbeats without an Accessibility change"
+            "nothing but heartbeats while nobody edits privacy settings"
         );
 
         thread::sleep(Duration::from_millis(60));
@@ -267,7 +298,7 @@ mod tests {
         drop(watch);
         assert!(
             !fired.load(Ordering::Acquire),
-            "no heartbeat and no Accessibility change means no wake"
+            "no heartbeat and no notification means no wake"
         );
     }
 }

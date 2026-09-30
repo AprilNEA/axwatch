@@ -5,8 +5,10 @@
 //! cargo run --example watch -- 5
 //! ```
 //!
-//! Then change any application's switch under System Settings → Privacy &
-//! Security → Accessibility and watch `Changed` arrive.
+//! Then edit any application's row under System Settings → Privacy &
+//! Security → Accessibility and watch the wakes arrive: adding, switching off
+//! and switching on post both notifications; removing posts only the Darwin
+//! one.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -23,9 +25,10 @@ fn main() -> io::Result<()> {
     };
     let started = Instant::now();
     println!(
-        "trusted={} observing {} heartbeat={heartbeat:?}",
+        "trusted={} observing {} + {} heartbeat={heartbeat:?}",
         axwatch::is_trusted(),
-        axwatch::NOTIFICATION,
+        axwatch::ACCESSIBILITY_NOTIFICATION,
+        axwatch::PRIVACY_NOTIFICATION,
     );
     let _watch = axwatch::Watch::start(heartbeat, move |wake| {
         println!(
